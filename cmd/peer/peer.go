@@ -5,6 +5,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"strings"
+	"sync"
 	"time"
 
 	libp2p "github.com/libp2p/go-libp2p"
@@ -15,6 +18,7 @@ import (
 	routingdisc "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	discutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	routedhost "github.com/libp2p/go-libp2p/p2p/host/routed"
+	"github.com/mattn/go-isatty"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/spf13/cobra"
 )
@@ -27,6 +31,51 @@ var (
 	flagRoom      string
 	flagMessage   string
 )
+
+type peerChat struct {
+	id peer.ID
+	rw *bufio.ReadWriter
+}
+
+var (
+	currentMu sync.RWMutex
+	current   *peerChat
+)
+
+func setCurrent(p peer.ID, rw *bufio.ReadWriter) {
+	currentMu.Lock()
+	current = &peerChat{id: p, rw: rw}
+	currentMu.Unlock()
+}
+
+func getCurrent() *peerChat {
+	currentMu.RLock()
+	defer currentMu.RUnlock()
+	return current
+}
+
+func startReadLoop(prefix string, rw *bufio.ReadWriter) {
+	go func() {
+		for {
+			line, err := rw.ReadString('\n')
+			if err != nil {
+				log.Printf("reader closed: %v", err)
+				return
+			}
+			line = strings.TrimRight(line, "\r\n")
+			fmt.Printf("%s: %s\n", prefix, line)
+		}
+	}()
+}
+
+func clearPreviousInputLine() {
+	fd := os.Stdout.Fd()
+	if isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd) {
+		// Move cursor up 1 line and clear it
+		// \x1b is ESC. [1A = cursor up, [2K = erase entire line
+		fmt.Print("\x1b[1A\x1b[2K")
+	}
+}
 
 func main() {
 	rootCmd := &cobra.Command{
@@ -89,11 +138,11 @@ func main() {
 			// 用 RoutedHost 包装，让 Connect 可以通过 DHT 解析对端地址
 			h := routedhost.Wrap(baseHost, kdht)
 
-			// 设置消息处理器
+			// 设置消息处理器（接收对端主动开的流）
 			h.SetStreamHandler(ProtocolID, func(s network.Stream) {
 				rw := bufio.NewReadWriter(bufio.NewReader(s), bufio.NewWriter(s))
-				msg, _ := rw.ReadString('\n')
-				log.Printf("📩 Received: %s", msg)
+				setCurrent(s.Conn().RemotePeer(), rw)
+				startReadLoop("peer", rw)
 			})
 
 			// 路由预热片刻，提升首次解析成功率
@@ -126,16 +175,41 @@ func main() {
 					cancel()
 					log.Printf("🤝 Connected to peer %s", p.ID)
 
-					// 打开聊天流并发送一条消息
+					// 打开聊天流并启动读循环
 					s, err := h.NewStream(ctx, p.ID, ProtocolID)
 					if err != nil {
 						log.Printf("❌ Failed to create stream to %s: %v", p.ID, err)
 						continue
 					}
 					rw := bufio.NewReadWriter(bufio.NewReader(s), bufio.NewWriter(s))
-					_, _ = rw.WriteString(flagMessage + "\n")
-					_ = rw.Flush()
-					log.Printf("📤 Sent message to %s", p.ID)
+					setCurrent(p.ID, rw)
+					startReadLoop("peer", rw)
+
+					if flagMessage != "" {
+						_, _ = rw.WriteString(flagMessage + "\n")
+						_ = rw.Flush()
+						fmt.Printf("me: %s\n", flagMessage)
+					}
+				}
+			}()
+
+			// 从标准输入读取并发送到当前 peer
+			go func() {
+				scanner := bufio.NewScanner(os.Stdin)
+				for scanner.Scan() {
+					text := scanner.Text()
+					pc := getCurrent()
+					if pc == nil || pc.rw == nil {
+						fmt.Println("(waiting for peer...)")
+						continue
+					}
+					clearPreviousInputLine()
+					_, _ = pc.rw.WriteString(text + "\n")
+					_ = pc.rw.Flush()
+					fmt.Printf("me: %s\n", text)
+				}
+				if err := scanner.Err(); err != nil {
+					log.Printf("stdin error: %v", err)
 				}
 			}()
 
