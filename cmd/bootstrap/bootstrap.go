@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -8,10 +9,13 @@ import (
 
 	libp2p "github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/network"
 
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 )
+
+const ProtocolID = "/chat/1.0.0"
 
 func main() {
 	listenPort := flag.Int("port", 9000, "listening port")
@@ -36,6 +40,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// 支持聊天协议，打印收到的消息
+	h.SetStreamHandler(ProtocolID, func(s network.Stream) {
+		rw := bufio.NewReadWriter(bufio.NewReader(s), bufio.NewWriter(s))
+		msg, _ := rw.ReadString('\n')
+		log.Printf("📩 [bootstrap] Received: %s", msg)
+	})
 
 	// 启动 Relay v2 服务
 	_, err = relayv2.New(h)
